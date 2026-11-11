@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>360互動極光森林</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background-color: #000; 
+      font-family: sans-serif;
+    }
+    #canvas-container {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+    }
+    #ui-layer {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      color: rgba(255, 255, 255, 0.6);
+      pointer-events: none;
+      z-index: 10;
+    }
+    /* p5.js 畫布覆蓋全螢幕負責攔截事件 */
+    #p5-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: 5;
+      cursor: grab;
+    }
+    #p5-canvas:active {
+      cursor: grabbing;
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+</head>
+<body>
+
+  <div id="canvas-container"></div>
+  <div id="p5-canvas"></div>
+  <div id="ui-layer">
+    <p>🔹 <b>按住拖曳</b>：轉動視角 (360度環景)</p>
+    <p>🔹 <b>移動滑鼠</b>：擾動極光並觸發色彩變化</p>
+  </div>
+
+  <script>
+    // ==========================================
+    // Three.js: 360度場景與極光著色器
+    // ==========================================
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    
+    // 透視相機 (建立 3D 空間感)
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, 0.1); // 相機放在球體中心略微偏移，避免萬向鎖
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    container.appendChild(renderer.domElement);
+
+    // 1. 建立背景球體 (全景森林底圖)
+    const textureLoader = new THREE.TextureLoader();
+    // 使用指定的檔案名稱作為底圖
+    const bgTexture = textureLoader.load('Gemini_Generated_Image_37lo1x37lo1x37lo.jpg');
+    
+    const bgGeometry = new THREE.SphereGeometry(500, 60, 40);
+    // scale(-1, 1, 1) 將球體內部翻轉，讓我們能從內部觀看
+    bgGeometry.scale(-1, 1, 1); 
+    const bgMaterial = new THREE.MeshBasicMaterial({ 
+      map: bgTexture 
+    });
+    const bgMesh = new THREE.Mesh(bgGeometry, bgMaterial);
+    scene.add(bgMesh);
+
+    // 2. 建立極光球體 (略小於背景球體，使用 Shader)
+    const auroraGeometry = new THREE.SphereGeometry(450, 60, 40);
+    auroraGeometry.scale(-1, 1, 1);
+
+    const uniforms = {
+      u_time: { value: 0.0 },
+      u_interaction: { value: new THREE.Vector2(0.0, 0.0) },
+      u_colorShift: { value: 0.0 } // 負責控制極光變色的變數
+    };
+
+    const vertexShader = `
+      varying vec2 vUv;
+      varying vec3 vPosition;
+      void main() {
+        vUv = uv;
+        vPosition = position;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+
+    const fragmentShader = `
+      uniform float u_time;
+      uniform vec2 u_interaction;
+      uniform float u_colorShift;
+      varying vec2 vUv;
+      varying vec3 vPosition;
+
+      float hash(vec2 p) { return fract(1e4 * sin(17.0 * p.x + p.y * 0.1) * (0.1 + abs(sin(p.y * 13.0 + p.x)))); }
+      float noise(vec2 x) {
+        vec2 i = floor(x);
+        vec2 f = fract(x);
+        float a = hash(i);
+        float b = hash(i + vec2(1.0, 0.0));
+        float c = hash(i + vec2(0.0, 1.0));
+        float d = hash(i + vec2(1.0, 1.0));
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+      }
+      
+      float fbm(vec2 p) {
+        float v = 0.0;
+        float a = 0.5;
+        vec2 shift = vec2(100.0);
+        mat2 rot = mat2(cos(0.5), sin(0.5), -sin(0.5), cos(0.5));
+        for (int i = 0; i < 5; ++i) {
+          v += a * noise(p);
+          p = rot * p * 2.0 + shift;
+          a *= 0.5;
+        }
+        return v;
+      }
+
+      void main() {
+        // 將球極座標 UV 展開為平面，配合視角
+        vec2 st = vUv * vec2(4.0, 2.0); 
+        vec2 offset = u_interaction * 1.5;
+        
+        float t = u_time * 0.15;
+        vec2 q = vec2(0.);
+        q.x = fbm(st + offset + vec2(t));
+        q.y = fbm(st + offset + vec2(t));
+
+        vec2 r = vec2(0.);
+        r.x = fbm(st + q + vec2(t * 1.2, t * 1.5));
+        r.y = fbm(st + q + vec2(t * 0.8, t * 1.1));
+
+        float f = fbm(st + r);
+
+        // --- 色彩變化邏輯 ---
+        // 靜態基礎色 (綠、深藍)
+        vec3 colorBase1 = vec3(0.0, 0.8, 0.4); 
+        vec3 colorEdge1 = vec3(0.1, 0.2, 0.8);
+        
+        // 活躍時色彩 (青藍、紫紅)
+        vec3 colorBase2 = vec3(0.0, 0.6, 1.0); 
+        vec3 colorEdge2 = vec3(0.8, 0.1, 0.6);
+
+        // 根據 u_colorShift 在兩組顏色中做混合
+        vec3 finalBase = mix(colorBase1, colorBase2, clamp(u_colorShift, 0.0, 1.0));
+        vec3 finalEdge = mix(colorEdge1, colorEdge2, clamp(u_colorShift, 0.0, 1.0));
+
+        vec3 color = mix(
+          finalBase,
+          finalEdge,
+          clamp(length(r.x), 0.0, 1.0)
+        );
+
+        color = (f * f * f + 0.6 * f * f + 0.5 * f) * color;
+
+        // 遮罩：極光主要出現在天空 (vUv.y 較大處)，並向地平線漸隱
+        float mask = smoothstep(0.4, 0.8, vUv.y);
+        
+        gl_FragColor = vec4(color, mask * f * 1.8);
+      }
+    `;
+
+    const auroraMaterial = new THREE.ShaderMaterial({
+      vertexShader,
+      fragmentShader,
+      uniforms,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    const auroraMesh = new THREE.Mesh(auroraGeometry, auroraMaterial);
+    scene.add(auroraMesh);
+
+    function animateThree() {
+      requestAnimationFrame(animateThree);
+      uniforms.u_time.value += 0.02;
+      renderer.render(scene, camera);
+    }
+    animateThree();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // ==========================================
+    // p5.js: 環景視角與互動演算層
+    // ==========================================
+    const sketch = (p) => {
+      // 攝影機環景角度控制 (球面座標)
+      let lon = 90, lat = 0;
+      let phi = 0, theta = 0;
+      
+      // 極光擾動向量控制
+      let targetVector;
+      let currentVector;
+
+      // 極光變色控制
+      let colorShiftTarget = 0;
+      let colorShiftCurrent = 0;
+
+      p.setup = () => {
+        let canvas = p.createCanvas(p.windowWidth, p.windowHeight);
+        canvas.parent('p5-canvas');
+        targetVector = p.createVector(0, 0);
+        currentVector = p.createVector(0, 0);
+        updateCamera();
+      };
+
+      p.draw = () => {
+        p.clear(); 
+
+        // 平滑插值 (Lerp)：讓極光的位移有彈性跟慣性
+        currentVector.lerp(targetVector, 0.05);
+        uniforms.u_interaction.value.set(currentVector.x, currentVector.y);
+
+        // 平滑插值色彩變化值
+        colorShiftCurrent = p.lerp(colorShiftCurrent, colorShiftTarget, 0.08);
+        uniforms.u_colorShift.value = colorShiftCurrent;
+
+        // 若無互動，向量與變色數值自動緩慢歸零 (風停了，顏色褪去)
+        targetVector.lerp(p.createVector(0, 0), 0.02);
+        colorShiftTarget = p.lerp(colorShiftTarget, 0.0, 0.02);
+      };
+
+      // 1. 單純移動滑鼠：改變極光型態與顏色
+      p.mouseMoved = () => {
+        let dx = (p.mouseX - p.pmouseX) * 0.015;
+        let dy = (p.mouseY - p.pmouseY) * 0.015;
+        targetVector.add(p.createVector(-dx, dy)); 
+
+        // 計算滑動速度，推升變色數值
+        let speed = p.dist(p.mouseX, p.pmouseY, p.pmouseX, p.pmouseY);
+        colorShiftTarget += speed * 0.02;
+        if (colorShiftTarget > 1.0) colorShiftTarget = 1.0; // 限制最大值
+      };
+
+      // 2. 按壓並拖曳：360度環顧場景 (不改變極光)
+      p.mouseDragged = () => {
+        lon += p.mouseX - p.pmouseX;
+        lat -= p.mouseY - p.pmouseY; // 上下反轉視角適應直覺
+        
+        // 限制上下視角，避免翻轉 (看見底部的穿幫)
+        lat = p.max(-30, p.min(85, lat)); 
+        updateCamera();
+      };
+
+      function updateCamera() {
+        phi = THREE.MathUtils.degToRad(90 - lat);
+        theta = THREE.MathUtils.degToRad(lon);
+
+        // 將球極座標轉換為 3D 直角座標系，給相機看
+        const x = 500 * Math.sin(phi) * Math.cos(theta);
+        const y = 500 * Math.cos(phi);
+        const z = 500 * Math.sin(phi) * Math.sin(theta);
+
+        camera.lookAt(x, y, z);
+      }
+
+      p.windowResized = () => {
+        p.resizeCanvas(p.windowWidth, p.windowHeight);
+      };
+    };
+
+    new p5(sketch);
+  </script>
+</body>
+</html>
